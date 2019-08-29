@@ -16,14 +16,15 @@
 CFLAGS := -Wall -Wextra -pedantic -std=gnu11
 LDFLAGS := -lpthread -lm
 
+HDR := $(wildcard *.h)
 SRC := $(wildcard *.c)
 OBJ := $(SRC:.c=.o)
 EXE = traffic
 
 .DEFAULT: $(EXE)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $^
+%.o: %.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(EXE): $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
