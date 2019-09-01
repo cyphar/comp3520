@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "barrier.h"
+#include "sync.h"
 
 /* Helper to deal with fatal errors. */
 #define bail(fmt, ...)														\
@@ -93,15 +93,15 @@ struct light_controller_t {
 	 * overlap). Since left-turn cars are in the same lane as "forward" cars,
 	 * the mutual exclusion is grouped by vehicle starting direction.
 	 *
+	 * In order to avoid a signal being missed, we have @blocked -- if this is false
+	 * If @blocked is false, then there
+	 *
 	 * To make life simpler, we just have NUM_DIRECTIONS (four) groups for all
 	 * light controllers (even though only two are necessary). The unused ones
 	 * don't really cost enough to be an issue, and it allows us to index using
 	 * HEADING_START().
 	 */
-	struct {
-		pthread_cond_t cond;
-		pthread_mutex_t lock;
-	} entry[NUM_DIRECTIONS];
+	signal_mailbox_t entry[NUM_DIRECTIONS];
 };
 
 /* Meta-structure for a vehicle -- thread has the responsibility to free it. */

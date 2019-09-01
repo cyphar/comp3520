@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #include "traffic.h"
-#include "barrier.h"
+#include "sync.h"
 
 /*
  *     |   |   |     .n.
@@ -89,8 +89,8 @@ static struct light_controller_t trunk_fwd_light = {
 	.id = { PACK_HEADING(NORTH, SOUTH), PACK_HEADING(SOUTH, NORTH) }, /* (n2s, s2n) */
 	.next = &minor_fwd_light,
 	.entry = {
-		[NORTH] = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
-		[SOUTH] = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
+		[NORTH] = SIGNAL_MAILBOX_INITIALIZER,
+		[SOUTH] = SIGNAL_MAILBOX_INITIALIZER,
 	},
 };
 
@@ -98,8 +98,8 @@ static struct light_controller_t minor_fwd_light = {
 	.id = { PACK_HEADING(EAST, WEST), PACK_HEADING(WEST, EAST) }, /* (e2w, w2e) */
 	.next = &trunk_right_light,
 	.entry = {
-		[EAST] = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
-		[WEST] = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
+		[EAST] = SIGNAL_MAILBOX_INITIALIZER,
+		[WEST] = SIGNAL_MAILBOX_INITIALIZER,
 	},
 };
 
@@ -107,8 +107,8 @@ static struct light_controller_t trunk_right_light = {
 	.id = { PACK_HEADING(NORTH, WEST), PACK_HEADING(SOUTH, EAST) }, /* (n2w, s2e) */
 	.next = &trunk_fwd_light,
 	.entry = {
-		[NORTH] = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
-		[EAST]  = { .cond = PTHREAD_COND_INITIALIZER, .lock = PTHREAD_MUTEX_INITIALIZER },
+		[NORTH] = SIGNAL_MAILBOX_INITIALIZER,
+		[EAST]  = SIGNAL_MAILBOX_INITIALIZER,
 	},
 };
 
@@ -149,23 +149,47 @@ static void *light_start(void *arg)
 	barrier_wait(self->ready);
 
 	for (;;) {
-		time_t red_deadline;
+		struct timespec red_deadline = { 0 };
 
 		/* Wait for our turn. */
 		sem_wait(&self->wake);
 
 		/* When do we need to turn red again? */
-		red_deadline = time(NULL) + self->green_interval;
+		red_deadline.tv_sec = time(NULL) + self->green_interval;
 
 		/* Until the deadline is reached, allow cars to pass. */
 		printf("The traffic lights %s have changed to green.\n", id);
-		while (time(NULL) < red_deadline) {
-			/* Signal both lanes to allow one vehicle to pass through. */
-			pthread_cond_signal(&self->entry[lane1].cond);
-			pthread_cond_signal(&self->entry[lane2].cond);
-			sleep(self->car_interval);
+		while (time(NULL) < red_deadline.tv_sec) {
+			/*
+			 * Create a new semaphore for each iteration so we can be sure that
+			 * we catch a crossing after we "send" new signals -- there isn't
+			 * any other fool-proof way to set the sempahore back to 0.
+			 */
+			arcsem_t *receipt = arcsem_new(0);
+
+			/*
+			 * Signal both lanes to allow one vehicle to pass through -- if
+			 * there's already a pending signal then this just updates the
+			 * receipt semaphore (freeing the old one).
+			 */
+			mailbox_signal(&self->entry[lane1], receipt);
+			mailbox_signal(&self->entry[lane2], receipt);
+
+			/* Wait for one of them to have passed. */
+			sem_timedwait(&receipt->inner, &red_deadline);
+
+			/*
+			 * We're done waiting -- the only references still alive are the
+			 * ones in the mailboxes (which will be cleared on our next loop or
+			 * by mailbox_retract).
+			 */
+			arcsem_put(receipt);
 		}
 		printf("The traffic lights %s will change to red now.\n", id);
+
+		/* Retract any remaining signals -- and free the semaphores. */
+		mailbox_retract(&self->entry[lane1]);
+		mailbox_retract(&self->entry[lane2]);
 
 		/* We pause for 2 seconds before triggering the next controller. */
 		sleep(2);
@@ -185,13 +209,13 @@ static void *vehicle_start(void *arg)
 	printf("Vehicle %d %s has arrived at the intersection.\n",
 	       self->id, heading_to_string(self->heading));
 
-	pthread_mutex_lock(&master->entry[lane].lock);
-	pthread_cond_wait(&master->entry[lane].cond, &master->entry[lane].lock);
+	mailbox_wait_lock(&master->entry[lane]);
 
 	printf("Vehicle %d %s is proceeding through the intersection.\n",
 	       self->id, heading_to_string(self->heading));
+	sleep(master->car_interval);
 
-	pthread_mutex_unlock(&master->entry[lane].lock);
+	mailbox_unlock(&master->entry[lane]);
 
 	free(self);
 	return NULL;
@@ -264,13 +288,18 @@ int main(void)
 		current->id = vehicle_counts[current->heading]++;
 
 		/*
-		 * Delay thread spawning based on whether
-		 * We need to delay spawning the thread depending on whether we spawned
-		 * a thread for the same direction in the past second.
+		 * Delay thread spawning based on when the last vehicle (with the same
+		 * heading) was spawned. This is all single-threaded, as required by
+		 * the assignment description (to be more physically accurate you would
+		 * have a separate thread for each possible heading, or some other
+		 * scheduling system to not block spawning other headings if the
+		 * current one needs a longer delay).
 		 */
 		if (vehicle_last_spawn[current->heading] < time(NULL))
+			/* Last vehicle spawned >1s ago -- [0,max_vehicle_period). */
 			delay = (1 + max_vehicle_period) * drand48();
 		else
+			/* Last vehicle spawned <=1s ago -- [1,max_vehicle_period). */
 			delay = 1 + (max_vehicle_period * drand48());
 
 		sleep(delay);
@@ -289,7 +318,6 @@ int main(void)
 		pthread_cancel(controllers[i]);
 
 	/* Clean up objects. */
-	barrier_destory(&ready_barrier);
 	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)
 		sem_destroy(&ALL_CONTROLLERS[i]->wake);
 
