@@ -221,6 +221,13 @@ static void *vehicle_start(void *arg)
 	return NULL;
 }
 
+static void readint(const char *prompt, int *value)
+{
+	printf("Enter %s (int): ", prompt);
+	if (scanf("%d", value) != 1)
+		bail("expected integer input to prompt!");
+}
+
 int main(void)
 {
 	int n_vehicles, max_vehicle_period, car_interval;
@@ -235,19 +242,16 @@ int main(void)
 	/* Seed PRNG. */
 	srand48(time(NULL) ^ getpid());
 
-	printf("Enter the total number of vehicles (int): ");
-	scanf("%d", &n_vehicles);
-	printf("Enter vehicles arrival rate (int): ");
-	scanf("%d", &max_vehicle_period);
-	printf("Enter minimum interval between two consecutive vehicles (int): ");
-	scanf("%d", &car_interval);
+	readint("the total number of vehicles", &n_vehicles);
+	readint("vehicles arrival rate", &max_vehicle_period);
+	readint("minimum interval between two consecutive vehicles", &car_interval);
 
-	printf("Enter green time for forward-moving vehicles on trunk road (int): ");
-	scanf("%d", &trunk_fwd_light.green_interval);
-	printf("Enter green time for vehicles on minor road (int): ");
-	scanf("%d", &minor_fwd_light.green_interval);
-	printf("Enter green time for right-turning vehicles on trunk road (int): ");
-	scanf("%d", &trunk_right_light.green_interval);
+	readint("green time for forward-moving vehicles on trunk road",
+			&trunk_fwd_light.green_interval);
+	readint("green time for vehicles on minor road",
+			&minor_fwd_light.green_interval);
+	readint("green time for right-turning vehicles on trunk road",
+			&trunk_right_light.green_interval);
 
 	/* We need all controllers and the main thread to be ready. */
 	barrier_init(&ready_barrier, ARRAY_LENGTH(ALL_CONTROLLERS) + 1);
@@ -312,10 +316,13 @@ int main(void)
 	/* Wait for all the vehicles to pass. */
 	for (ssize_t i = 0; i < n_vehicles; i++)
 		pthread_join(vehicles[i], NULL);
+	free(vehicles);
 
-	/* Kill the controllers. */
+	/* Kill the controllers (first cancel, then join). */
 	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)
 		pthread_cancel(controllers[i]);
+	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)
+		pthread_join(controllers[i], NULL);
 
 	/* Clean up objects. */
 	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)

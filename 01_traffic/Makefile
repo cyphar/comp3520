@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-CFLAGS := -Wall -Wextra -pedantic -std=gnu11
+CFLAGS := -O2 -D_FORTIFY_SOURCE=2 -Wall -Wextra -pedantic -std=gnu99
 LDFLAGS := -lpthread -lm
 
 HDR := $(wildcard *.h)
@@ -23,11 +23,14 @@ EXE = traffic
 
 .DEFAULT: $(EXE)
 
+# Rule to build object files from C source files (gcc -c).
 %.o: %.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Rule to link object files into final binary.
 $(EXE): $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+# Rule to clean up built artefacts.
 clean:
 	$(RM) $(EXE) $(OBJ)
