@@ -20,7 +20,6 @@
 
 #include <errno.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -67,7 +66,7 @@ struct light_controller_t {
 	struct light_controller_t *next;
 
 	/* How long between cars entrying the intersection (in seconds)? */
-	int car_interval;
+	int intersection_gap;
 	/* How long does this light stay green (in seconds)? */
 	int green_interval;
 
@@ -79,22 +78,18 @@ struct light_controller_t {
 	barrier_t *ready;
 
 	/*
-	 * Semaphore used to wake up this controller in a way that doesn't have to
-	 * deal with condition variable races (or un-ergonomic usages of
-	 * pthread_mutex_t). Triggered (incremented) by the _previous_ controller
-	 * after it has finished.
+	 * Mailbox for indicating that it's this controller's turn to work.
+	 * Triggered by the _previous_ controller after it has finished (after the
+	 * 2-second all-lights-red gap).
 	 */
-	sem_t wake;
+	signal_mailbox_t wake;
 
 	/*
-	 * Condition variable (and mutex) used by vehicles to decide whether or not
-	 * they can travel through the intersection. Only one car can be in one
-	 * lane in the intersection at a time (though cars in different lanes can
-	 * overlap). Since left-turn cars are in the same lane as "forward" cars,
-	 * the mutual exclusion is grouped by vehicle starting direction.
-	 *
-	 * In order to avoid a signal being missed, we have @blocked -- if this is false
-	 * If @blocked is false, then there
+	 * Mailbox used by vehicles to decide whether or not they can travel
+	 * through the intersection. Only one car can be in one lane in the
+	 * intersection at a time (though cars in different lanes can overlap).
+	 * Since left-turn cars are in the same lane as "forward" cars, this
+	 * lane-based mutual exclusion is grouped by vehicle starting direction.
 	 *
 	 * To make life simpler, we just have NUM_DIRECTIONS (four) groups for all
 	 * light controllers (even though only two are necessary). The unused ones

@@ -19,7 +19,6 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +87,7 @@ static struct light_controller_t trunk_right_light;
 static struct light_controller_t trunk_fwd_light = {
 	.id = { PACK_HEADING(NORTH, SOUTH), PACK_HEADING(SOUTH, NORTH) }, /* (n2s, s2n) */
 	.next = &minor_fwd_light,
+	.wake = SIGNAL_MAILBOX_INITIALIZER,
 	.entry = {
 		[NORTH] = SIGNAL_MAILBOX_INITIALIZER,
 		[SOUTH] = SIGNAL_MAILBOX_INITIALIZER,
@@ -97,6 +97,7 @@ static struct light_controller_t trunk_fwd_light = {
 static struct light_controller_t minor_fwd_light = {
 	.id = { PACK_HEADING(EAST, WEST), PACK_HEADING(WEST, EAST) }, /* (e2w, w2e) */
 	.next = &trunk_right_light,
+	.wake = SIGNAL_MAILBOX_INITIALIZER,
 	.entry = {
 		[EAST] = SIGNAL_MAILBOX_INITIALIZER,
 		[WEST] = SIGNAL_MAILBOX_INITIALIZER,
@@ -106,6 +107,7 @@ static struct light_controller_t minor_fwd_light = {
 static struct light_controller_t trunk_right_light = {
 	.id = { PACK_HEADING(NORTH, WEST), PACK_HEADING(SOUTH, EAST) }, /* (n2w, s2e) */
 	.next = &trunk_fwd_light,
+	.wake = SIGNAL_MAILBOX_INITIALIZER,
 	.entry = {
 		[NORTH] = SIGNAL_MAILBOX_INITIALIZER,
 		[EAST]  = SIGNAL_MAILBOX_INITIALIZER,
@@ -140,6 +142,9 @@ static void *light_start(void *arg)
 	                              heading_to_string(self->id[1])) < 0)
 		bail("asprintf(light controller id) failed");
 
+	/* Clean up the id string when pthread_cancell'd. */
+	pthread_cleanup_push(free, id);
+
 	lane1 = HEADING_START(self->id[0]);
 	lane2 = HEADING_START(self->id[1]);
 
@@ -152,7 +157,7 @@ static void *light_start(void *arg)
 		struct timespec red_deadline = { 0 };
 
 		/* Wait for our turn. */
-		sem_wait(&self->wake);
+		mailbox_wait_lock(&self->wake);
 
 		/* When do we need to turn red again? */
 		red_deadline.tv_sec = time(NULL) + self->green_interval;
@@ -185,18 +190,21 @@ static void *light_start(void *arg)
 			 */
 			arcsem_put(receipt);
 		}
-		printf("The traffic lights %s will change to red now.\n", id);
-
 		/* Retract any remaining signals -- and free the semaphores. */
 		mailbox_retract(&self->entry[lane1]);
 		mailbox_retract(&self->entry[lane2]);
 
+		/* No more car crossings from here on. */
+		printf("The traffic lights %s will change to red now.\n", id);
+
 		/* We pause for 2 seconds before triggering the next controller. */
 		sleep(2);
-		sem_post(&self->next->wake);
+		mailbox_unlock(&self->wake);
+		mailbox_signal(&self->next->wake, NULL);
 	}
 
-	free(id);
+	/* Should never be reached. */
+	pthread_cleanup_pop(true);
 	return NULL;
 }
 
@@ -213,7 +221,7 @@ static void *vehicle_start(void *arg)
 
 	printf("Vehicle %d %s is proceeding through the intersection.\n",
 	       self->id, heading_to_string(self->heading));
-	sleep(master->car_interval);
+	sleep(master->intersection_gap);
 
 	mailbox_unlock(&master->entry[lane]);
 
@@ -230,10 +238,10 @@ static void readint(const char *prompt, int *value)
 
 int main(void)
 {
-	int n_vehicles, max_vehicle_period, car_interval;
+	int num_vehicles, max_arrival_gap, intersection_gap;
 
-	int vehicle_counts[NUM_DIRECTIONS * NUM_DIRECTIONS] = { 0 };
-	time_t vehicle_last_spawn[NUM_DIRECTIONS * NUM_DIRECTIONS] = { 0 };
+	int next_vehicle_id[NUM_DIRECTIONS * NUM_DIRECTIONS] = { 0 };
+	time_t last_vehicle_spawn[NUM_DIRECTIONS * NUM_DIRECTIONS] = { 0 };
 
 	barrier_t ready_barrier;
 	pthread_t controllers[ARRAY_LENGTH(ALL_CONTROLLERS)] = { 0 };
@@ -242,9 +250,9 @@ int main(void)
 	/* Seed PRNG. */
 	srand48(time(NULL) ^ getpid());
 
-	readint("the total number of vehicles", &n_vehicles);
-	readint("vehicles arrival rate", &max_vehicle_period);
-	readint("minimum interval between two consecutive vehicles", &car_interval);
+	readint("the total number of vehicles", &num_vehicles);
+	readint("vehicles arrival rate", &max_arrival_gap);
+	readint("minimum interval between two consecutive vehicles", &intersection_gap);
 
 	readint("green time for forward-moving vehicles on trunk road",
 			&trunk_fwd_light.green_interval);
@@ -259,9 +267,8 @@ int main(void)
 	/* Set up the controllers. */
 	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++) {
 		struct light_controller_t *current = ALL_CONTROLLERS[i];
-		sem_init(&current->wake, 0, 0);
 		current->ready = &ready_barrier;
-		current->car_interval = car_interval;
+		current->intersection_gap = intersection_gap;
 	}
 
 	/* Spawn light controllers. */
@@ -274,13 +281,13 @@ int main(void)
 	/* Wait until all controllers are ready ... */
 	barrier_wait(&ready_barrier);
 	/* ... then trigger the default state. */
-	sem_post(&trunk_fwd_light.wake);
+	mailbox_signal(&trunk_fwd_light.wake, NULL);
 
 	/* Spawn vehicle threads. */
-	vehicles = calloc(n_vehicles, sizeof(*vehicles));
+	vehicles = calloc(num_vehicles, sizeof(*vehicles));
 	if (!vehicles)
 		bail("calloc(vehicles) failed");
-	for (ssize_t i = 0; i < n_vehicles; i++) {
+	for (ssize_t i = 0; i < num_vehicles; i++) {
 		int delay;
 		struct vehicle_t *current;
 
@@ -289,7 +296,7 @@ int main(void)
 			bail("malloc(vehicle_t[%ld]) failed", i);
 
 		current->heading = random_heading();
-		current->id = vehicle_counts[current->heading]++;
+		current->id = next_vehicle_id[current->heading]++;
 
 		/*
 		 * Delay thread spawning based on when the last vehicle (with the same
@@ -299,22 +306,22 @@ int main(void)
 		 * scheduling system to not block spawning other headings if the
 		 * current one needs a longer delay).
 		 */
-		if (vehicle_last_spawn[current->heading] < time(NULL))
-			/* Last vehicle spawned >1s ago -- [0,max_vehicle_period). */
-			delay = (1 + max_vehicle_period) * drand48();
+		if (last_vehicle_spawn[current->heading] < time(NULL))
+			/* Last vehicle spawned >1s ago -- [0,max_arrival_gap). */
+			delay = (1 + max_arrival_gap) * drand48();
 		else
-			/* Last vehicle spawned <=1s ago -- [1,max_vehicle_period). */
-			delay = 1 + (max_vehicle_period * drand48());
+			/* Last vehicle spawned <=1s ago -- [1,max_arrival_gap). */
+			delay = 1 + (max_arrival_gap * drand48());
 
 		sleep(delay);
-		vehicle_last_spawn[current->heading] = time(NULL);
+		last_vehicle_spawn[current->heading] = time(NULL);
 
 		if (pthread_create(&vehicles[i], NULL, vehicle_start, current) < 0)
 			bail("pthread_create(vehicle[%ld]) failed", i);
 	}
 
 	/* Wait for all the vehicles to pass. */
-	for (ssize_t i = 0; i < n_vehicles; i++)
+	for (ssize_t i = 0; i < num_vehicles; i++)
 		pthread_join(vehicles[i], NULL);
 	free(vehicles);
 
@@ -323,10 +330,6 @@ int main(void)
 		pthread_cancel(controllers[i]);
 	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)
 		pthread_join(controllers[i], NULL);
-
-	/* Clean up objects. */
-	for (size_t i = 0; i < ARRAY_LENGTH(ALL_CONTROLLERS); i++)
-		sem_destroy(&ALL_CONTROLLERS[i]->wake);
 
 	printf("Main thread: There are no more vehicles to serve. "
 	       "The simulation will end now.\n");
